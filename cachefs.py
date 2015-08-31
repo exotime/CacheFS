@@ -36,7 +36,7 @@ class FileDataCache:
     def cache_file(self, path):
         return os.path.normpath(os.path.join(self.cachebase, "file_data") + path)
 
-    def __init__(self, db, cachebase, cache_size, path, flags = os.O_RDWR, node_id = None):
+    def __init__(self, db, cachebase, cache_size, path, charset="utf-8", flags = os.O_RDWR, node_id = None):
         self.cachebase = cachebase
         self.full_path = self.cache_file(path)
 
@@ -45,7 +45,7 @@ class FileDataCache:
         except OSError:
             pass
 
-        self.path = path
+        self.path = path.decode(charset)
         self.db = db
 
         self.cache_size = cache_size
@@ -274,7 +274,7 @@ def make_file_class(file_system):
                 self.f = os.open(self.pp, flags)
 
             inode_id = os.stat(self.pp).st_ino
-            self.data_cache = FileDataCache(file_system.cache_db, file_system.cache, file_system.cache_size, path, flags, inode_id)
+            self.data_cache = FileDataCache(file_system.cache_db, file_system.cache, file_system.cache_size, path, file_system.charset, flags, inode_id)
 
         def read(self, size, offset):
             try:
@@ -355,7 +355,7 @@ class CacheFS(fuse.Fuse):
 #        print('>> unlink("%s")' % path)
         os.remove(self._physical_path(path))
         try:
-            FileDataCache(self.cache_db, self.cache, self.cache_size, path).unlink()
+            FileDataCache(self.cache_db, self.cache, self.cache_size, path, self.charset).unlink()
         except:
             pass
         return 0
@@ -392,14 +392,14 @@ class CacheFS(fuse.Fuse):
     def link(self, target, name):
         print('>> link(%s, %s)' % (target, name))
         os.link(self._physical_path(target), self._physical_path(name))
-        FileDataCache(self.cache_db, self.cache, self.cache_size, name, None, os.stat(self._physical_path(name)).st_ino)
+        FileDataCache(self.cache_db, self.cache, self.cache_size, name, self.charset, None, os.stat(self._physical_path(name)).st_ino)
 
     def rename(self, old_name, new_name):
         print('>> rename(%s, %s)' % (old_name, new_name))
         os.rename(self._physical_path(old_name),
                   self._physical_path(new_name))
         try:
-            fdc = FileDataCache(self.cache_db, self.cache, self.cache_size, old_name)
+            fdc = FileDataCache(self.cache_db, self.cache, self.cache_size, old_name, self.charset)
             fdc.rename(new_name)
         except :
             pass
@@ -415,7 +415,7 @@ class CacheFS(fuse.Fuse):
         f.truncate(len)
         f.close()
         try:
-            cache = FileDataCache(self.cache_db, self.cache, self.cache_size, path)
+            cache = FileDataCache(self.cache_db, self.cache, self.cache_size, path, self.charset)
             cache.open()
             cache.truncate(len)
             cache.close()
@@ -482,6 +482,11 @@ def main():
         default=1 * 1024 * 1024 * 1024,
         help="size of the cache in bytes")
 
+    server.parser.add_option(
+        mountopt="charset", metavar="PATH CHARSET",
+        default="utf-8",
+        help="charset of the target files system")
+
     # Wire server.target to command line options
     server.parser.add_option(
         mountopt="target", metavar="PATH",
@@ -515,6 +520,10 @@ def main():
     
     server.cache_db = create_db(cache_dir)
     
+    try:
+        server.charset
+    except AttributeError:
+        server.charset = "utf-8"
         
 
     #except AttributeError as e:
@@ -526,6 +535,7 @@ def main():
 
     print 'Setting up CacheFS %s ...' % CACHE_FS_VERSION
     print '  Target         : %s' % server.target
+    print '  Target charset : %s' % server.charset
     print '  Cache          : %s' % server.cache
     print '  Cache max size : %s' % server.cache_size
     print '  Mount Point    : %s' % os.path.abspath(server.fuse_args.mountpoint)
