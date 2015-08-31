@@ -498,7 +498,10 @@ def main():
 #    try:
     server.target = os.path.abspath(server.target)
 
-    server.cache_size = int(server.cache_size)
+    try:
+        server.cache_size = int(server.cache_size)
+    except AttributeError:
+        server.cache_size = 1 * 1024 * 1024 * 1024
     try:
         cache_dir = server.cache
     except AttributeError:
