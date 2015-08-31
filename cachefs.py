@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 
-import shutil
 import time
 import os
 import stat
@@ -189,19 +188,20 @@ class FileDataCache:
         return
 
     def unlink(self):
-        shutil.rmtree(self.full_path)
+        os.remove(self.full_path)
         with self.db:
             self.db.execute("DELETE FROM paths WHERE path = ?", self.path)
             count = self.db.execute("SELECT COUNT(*) FROM paths WHERE paths.path = ? ", self.path).fetchone()[0]
             if count == 0:
                 self.db.execute("DELETE FROM nodes WHERE node_id = ? ", self.node_id)
+                self.db.execute("DELETE FROM blocks WHERE node_id = ?", (self.node_id,))
 
 
     @staticmethod
     def rmdir(cache_base, path):
         d = os.path.join(cache_base, "file_data") + path
         try:
-            shutil.rmtree(d)
+            os.rmdir(d)
         except:
             pass
 
@@ -445,10 +445,16 @@ def main():
     server.parse(values=server, errex=1)
 #    try:
     server.target = os.path.abspath(server.target)
+
+    server.cache_size = int(server.cache_size)
     try:
         cache_dir = server.cache
     except:
         import hashlib
+        try:
+            os.mkdir(os.path.join(os.path.expanduser("~"), ".cachefs"))
+        except OSError:
+            pass
         cache_dir = os.path.join(os.path.expanduser("~"),
                                  ".cachefs",
                                  hashlib.md5(server.target).hexdigest())
