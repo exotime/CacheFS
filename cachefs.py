@@ -27,11 +27,16 @@ class CacheMiss(Exception):
         debug(">> CACHE MISS")
     pass
 
+class CacheFull(Exception):
+    def __init__(self):
+        debug(">> CACHE FULL")
+    pass
+
 class FileDataCache:
     def cache_file(self, path):
-        return os.path.join(self.cachebase, "file_data") + path
+        return os.path.normpath(os.path.join(self.cachebase, "file_data") + path)
 
-    def __init__(self, db, cachebase, path, flags = os.O_RDWR, node_id = None):
+    def __init__(self, db, cachebase, cache_size, path, flags = os.O_RDWR, node_id = None):
         self.cachebase = cachebase
         self.full_path = self.cache_file(path)
 
@@ -42,6 +47,8 @@ class FileDataCache:
 
         self.path = path
         self.db = db
+
+        self.cache_size = cache_size
 
         self.cache = None
 
@@ -165,14 +172,43 @@ class FileDataCache:
 
         return buf
 
-    def update(self, buff, offset, last_bytes=False):
+    def update(self, buff, offset, last_bytes=False, path=None):
 #        print ">>> UPDATE (len: %s, offset, %s)" % (len(buff), offset)
 #        self.open()
+        needed_size = len(buff)
+        self._make_room(needed_size)
         os.lseek(self.cache, offset, os.SEEK_SET)
         os.write(self.cache, buff)
-
         self.__add_block___(offset, len(buff), last_bytes)
 #        self.close()
+
+    def _current_cache_size(self):
+        with self.db:
+            for size, in self.db.execute("SELECT SUM(end - offset) AS size FROM blocks"):
+                if size:
+                    return size
+        return 0
+
+    def _make_room(self, needed_size):
+        cache_size = self._current_cache_size()
+        if (cache_size + needed_size) > self.cache_size:
+            node_id_to_delete = []
+            for size, last_use, node_id in self.db.execute("SELECT SUM(end - offset) AS size, last_use, node_id FROM blocks, nodes WHERE nodes.id = blocks.node_id AND blocks.node_id != ? GROUP BY node_id ORDER BY last_use ASC;", (self.node_id,)):
+                cache_size -= size
+                node_id_to_delete.append(node_id)
+                if cache_size + needed_size <= self.cache_size:
+                    break
+            else:
+                raise CacheFull()
+            for node_id in node_id_to_delete:
+                for path, in self.db.execute("SELECT path FROM paths WHERE node_id = ?", (node_id,)):
+                    path = self.cache_file(path.encode("utf-8"))
+                    if path.startswith(self.cachebase):
+                        os.remove(path)
+                with self.db:
+                    self.db.execute("DELETE FROM paths WHERE node_id = ?", (node_id,))
+                    self.db.execute("DELETE FROM blocks WHERE node_id = ?", (node_id,))
+                    self.db.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
 
     def truncate(self, l):
 #        print ">>> TRUNCATE (cache: %s, len: %s)" % (self.cache, l)
@@ -238,7 +274,7 @@ def make_file_class(file_system):
                 self.f = os.open(self.pp, flags)
 
             inode_id = os.stat(self.pp).st_ino
-            self.data_cache = FileDataCache(file_system.cache_db, file_system.cache, path, flags, inode_id)
+            self.data_cache = FileDataCache(file_system.cache_db, file_system.cache, file_system.cache_size, path, flags, inode_id)
 
         def read(self, size, offset):
             try:
@@ -247,7 +283,10 @@ def make_file_class(file_system):
                 os.lseek(self.f, offset, os.SEEK_SET)
                 buf = os.read(self.f, size)
                 
-                self.data_cache.update(buf, offset, os.read(self.f, 1)=='')
+                try:
+                    self.data_cache.update(buf, offset, os.read(self.f, 1)=='', self.path)
+                except CacheFull:
+                    pass
             return buf
         
         def write(self, buf, offset):
@@ -256,7 +295,10 @@ def make_file_class(file_system):
             os.write(self.f, buf)
 
             end = os.stat(self.pp).st_size
-            self.data_cache.update(buf, offset, offset + len(buf) == end)
+            try:
+                self.data_cache.update(buf, offset, offset + len(buf) == end, self.path)
+            except CacheFull:
+                pass
 
             return len(buf)
 
@@ -313,7 +355,7 @@ class CacheFS(fuse.Fuse):
 #        print('>> unlink("%s")' % path)
         os.remove(self._physical_path(path))
         try:
-            FileDataCache(self.cache_db, self.cache, path).unlink()
+            FileDataCache(self.cache_db, self.cache, self.cache_size, path).unlink()
         except:
             pass
         return 0
@@ -350,14 +392,14 @@ class CacheFS(fuse.Fuse):
     def link(self, target, name):
         print('>> link(%s, %s)' % (target, name))
         os.link(self._physical_path(target), self._physical_path(name))
-        FileDataCache(self.cache_db, self.cache, name, None, os.stat(self._physical_path(name)).st_ino)
+        FileDataCache(self.cache_db, self.cache, self.cache_size, name, None, os.stat(self._physical_path(name)).st_ino)
 
     def rename(self, old_name, new_name):
         print('>> rename(%s, %s)' % (old_name, new_name))
         os.rename(self._physical_path(old_name),
                   self._physical_path(new_name))
         try:
-            fdc = FileDataCache(self.cache_db, self.cache, old_name)
+            fdc = FileDataCache(self.cache_db, self.cache, self.cache_size, old_name)
             fdc.rename(new_name)
         except :
             pass
@@ -373,7 +415,7 @@ class CacheFS(fuse.Fuse):
         f.truncate(len)
         f.close()
         try:
-            cache = FileDataCache(self.cache_db, self.cache, path)
+            cache = FileDataCache(self.cache_db, self.cache, self.cache_size, path)
             cache.open()
             cache.truncate(len)
             cache.close()
@@ -435,6 +477,11 @@ def main():
         default=None,
         help="Path to place the cache")
 
+    server.parser.add_option(
+        mountopt="cache_size", metavar="N",
+        default=1 * 1024 * 1024 * 1024,
+        help="size of the cache in bytes")
+
     # Wire server.target to command line options
     server.parser.add_option(
         mountopt="target", metavar="PATH",
@@ -449,7 +496,7 @@ def main():
     server.cache_size = int(server.cache_size)
     try:
         cache_dir = server.cache
-    except:
+    except AttributeError:
         import hashlib
         try:
             os.mkdir(os.path.join(os.path.expanduser("~"), ".cachefs"))
@@ -458,6 +505,7 @@ def main():
         cache_dir = os.path.join(os.path.expanduser("~"),
                                  ".cachefs",
                                  hashlib.md5(server.target).hexdigest())
+
     server.multithreaded = 0
     server.cache = os.path.abspath(cache_dir)
     try:
@@ -477,9 +525,10 @@ def main():
     #    pass
 
     print 'Setting up CacheFS %s ...' % CACHE_FS_VERSION
-    print '  Target       : %s' % server.target
-    print '  Cache        : %s' % server.cache
-    print '  Mount Point  : %s' % os.path.abspath(server.fuse_args.mountpoint)
+    print '  Target         : %s' % server.target
+    print '  Cache          : %s' % server.cache
+    print '  Cache max size : %s' % server.cache_size
+    print '  Mount Point    : %s' % os.path.abspath(server.fuse_args.mountpoint)
     print
     print 'Unmount through:'
     print '  fusermount -u %s' % server.fuse_args.mountpoint
