@@ -29,12 +29,12 @@ class CacheMiss(Exception):
     def __init__(self):
         debug(">> CACHE MISS")
     pass
-
+    
 class FileDataCache:
     def cache_file(self, path):
         return os.path.normpath(os.path.join(self.cache_dir, "file_data") + path)
 
-    def __init__(self, cache_dir, cache_size, path, db_end, charset="utf-8", flags = os.O_RDWR, node_id = None):
+    def __init__(self, cache_dir, cache_size, path, charset="utf-8", flags = os.O_RDWR, node_id = None):
         self.cache_dir = cache_dir
         self.full_path = self.cache_file(path)
         try:
@@ -44,7 +44,6 @@ class FileDataCache:
 
         self.path = path.decode(charset)
         self.cache_size = cache_size
-        self.db_end = db_end
         self.cache = None
         self.flags = os.O_RDWR | ( flags &
                                    os.O_CREAT &
@@ -100,7 +99,6 @@ class FileDataCache:
         if self.hits + self.misses:
             rate = 100*float(self.hits)/(self.hits + self.misses)
 
-        #pprint.pprint(self.known_offsets())
         #print ">> %s Hits: %d, Misses: %d, Rate: %f%%" % (self.path, self.hits, self.misses, rate)
 
     def __del__(self):
@@ -110,10 +108,11 @@ class FileDataCache:
         if self.cache:
             os.close(self.cache)
             self.cache = None
-        db = open_db(self.cache_dir)
-        with db:
-            db.execute("UPDATE file SET open = 0 WHERE node_id = ?", (self.node_id,))
-        db.close()
+
+            db = open_db(self.cache_dir)
+            with db:
+                db.execute("UPDATE file SET open = 0 WHERE node_id = ?", (self.node_id,))
+            db.close()
 
     def __conditions__(self, offset, length=None):
         if length != None:
@@ -128,21 +127,23 @@ class FileDataCache:
                     (self.node_id,            offset,     offset)]
 
     def __overlapping_block__(self, offset):
+        return_offset = None
+        return_size = None
+        return_last = False
+
         conditions = self.__conditions__(offset)
-    
         query = "select offset, end, last_block from file_blocks where %s" % conditions[0]
         db = open_db(self.cache_dir)
         with db:
             for db_offset, db_end, last_block in db.execute(query, conditions[1]):
-                db.close()
-                return (db_offset, db_end - db_offset, last_block)
-
+                return_offset = db_offset
+                return_size = (db_end - db_offset)
+                return_last = last_block
         db.close()
-        return (None, None, False)
+        return (return_offset, return_size, return_last)
 
     def __add_block___(self, offset, length, last_bytes):
         end = offset + length
-
         conditions = self.__conditions__(offset, length)
         query = "select min(offset), max(end) from file_blocks where %s" % conditions[0]
         db = open_db(self.cache_dir)
@@ -152,14 +153,10 @@ class FileDataCache:
                     continue
                 offset = min(offset, db_offset)
                 end = max(end, db_end) 
-
             db.execute("delete from file_blocks where %s" % conditions[0], conditions[1])
             db.execute('insert into file_blocks values (?, ?, ?, ?)', (self.node_id, offset, end, last_bytes))
 
         db.close()
-
-        # Update db_end value for read a head process
-        self.db_end.value = end
         return
 
     def read(self, size, offset):
@@ -167,20 +164,10 @@ class FileDataCache:
         (addr, s, last_bytes) = self.__overlapping_block__(offset)
         if addr == None or (addr + s < offset + size and not last_bytes):
             self.misses += size
-            if addr is None and s is None:
-                self.db_end.value = offset
-            elif addr is None and s is not None:
-                self.db_end.value = s
-            else:
-                self.db_end.value = (addr + s)
             raise CacheMiss
-
         os.lseek(self.cache, offset, os.SEEK_SET)
         buf = os.read(self.cache, size)
         self.hits += len(buf)
-        
-        # Update db_end value for read a head process
-        self.db_end.value = (addr + s)
         return buf
 
     def update(self, buff, offset, last_bytes=False, path=None):
@@ -219,8 +206,6 @@ class FileDataCache:
                     for path, in db.execute("SELECT path FROM file WHERE node_id = ?", (node_id,)):
                         path = self.cache_file(path.encode("utf-8"))
                         if path.startswith(self.cache_dir) and os.path.exists(path):
-                            print "I am able to remove it!"
-                            print path
                             os.remove(path)
 
                     db.execute("DELETE FROM file WHERE node_id = ?", (node_id,))
@@ -276,116 +261,17 @@ class FileDataCache:
         os.rename(self.full_path, new_full_path)
 
 
-
-#class ReadAHead(Process):
-class ReadAHead(Thread):    
-    def __init__(self, file_system, path, flags, mode, offset, db_end, size, read_a_head_error, read_a_head_queue):
-        # Need for class to be properly initialized as a Process subclass
-        Thread.__init__(self)
-
-        # Variables needed in read a head process
-        self.exit = Event()
-        self.lock = Lock()
-        self.file_system = file_system
-        self.path = path
-        self.flags = flags
-        self.mode = mode
-        self.size = size
-        self.pp = file_system._physical_path(self.path)
-        self.inode_id = os.stat(self.pp).st_ino
-        self.offset = offset
-        self.db_end = db_end
-        self.read_a_head_error = read_a_head_error
-        self.read_a_head_queue = read_a_head_queue
-
-        # Place holders. Can't initialize until the process is "started" or we will leave orphaned file descriptors in main process 
-        self.rah_f = None
-        self.rah_db = None
-        self.rah_data_cache = None
-
-    def run(self):
-        # Log output from process to file - for debuging
-        #sys.stdout = open("/home/conrad/cacheFS/thread.log", "a", buffering=0)
-        #sys.stderr = open("/home/conrad/cacheFS/thread.log", "a", buffering=0)
-
-        extra_print = False
-        if len(self.mode) > 0:
-            self.rah_f = os.open(self.pp, self.flags, self.mode[0])
-        else:
-            self.rah_f = os.open(self.pp, self.flags)
-
-        self.rah_db = sqlite3.connect(os.path.join(self.file_system.cache, "metadata.db"), isolation_level="Immediate", timeout=1.0)
-        self.rah_data_cache = FileDataCache(self.rah_db, self.file_system.cache, self.file_system.cache_size, self.path, self.db_end, self.file_system.charset, self.flags, self.inode_id, True)
-
-        while not self.exit.is_set():
-
-            if os.getppid() == 1:
-                print "Parent process has terminated"
-                break
-
-            if extra_print:
-                extra_print = False
-                print "Print after negative"
-                print "db_end = %s" % self.db_end.value
-                print "offest = %s" % self.offset.value
-
-            print "Buffer = %s MB" % ((long(self.db_end.value) - long(self.offset.value))/long(1048576))
-            if (long(self.db_end.value) - long(self.offset.value)) < 0:
-                print "Less than zero"
-                print "db_end = %s" % self.db_end.value
-                print "offest = %s" % self.offset.value
-                extra_print = True
-
-            if 0 <= (long(self.db_end.value) - long(self.offset.value)) <= 52428800 and long(self.db_end.value) < long(self.size):
-                #print "Reading a head - %s" % os.getpid()
-                try:
-                    os.lseek(self.rah_f, self.db_end.value, os.SEEK_SET)
-                    buf = os.read(self.rah_f, 131072)
-                    # If offset == to db_end, read has either caught up to the read_a_head process or this is the first access.
-                    # Return the data before writing it to cache to improve read speed.
-                    if long(self.offset.value) >= long(self.db_end.value):
-                        #print "Trying to add to queue"
-                        self.read_a_head_queue.put([self.db_end.value, buf])
-                        #print "Added!"
-                    self.lock.acquire()
-                    self.rah_data_cache.update(buf, self.db_end.value, self.db_end.value + len(buf) == self.size, self.path)
-                    self.lock.release()
-                except OSError as e:
-                    print "Error = %s" %e
-                    self.read_a_head_error.value = True
-
-                #print "read a head done"
-            else:
-                # Wait to prevent process from using all the CPU resources
-                #print "sleeping - %s" % os.getpid()
-                time.sleep(0.05)
-
-        self.release()
-        sys.exit()
-        return
-
-    def shutdown(self):
-        #print "Shutdown initiated"
-        self.exit.set()
-
-    def release(self):
-        #print "Releasing"
-        os.close(self.rah_f)
-        self.rah_data_cache.close()
-        self.rah_db.close()
-        return      
-
-
 def File(file_system):
     class CacheFile(object):
         direct_io = False
         keep_cache = False
     
         def __init__(self, path, flags, *mode):
+             #print('>> file<%s>.open(flags=%d, mode=%s)' % (self.pp, flags, mode))
             self.path = path
             self.pp = file_system._physical_path(self.path)
-            #print('>> file<%s>.open(flags=%d, mode=%s)' % (self.pp, flags, mode))
-
+            self.size = os.stat(self.pp).st_size
+           
             if len(mode) > 0:
                 self.f = os.open(self.pp, flags, mode[0])
             else:
@@ -393,85 +279,29 @@ def File(file_system):
 
             inode_id = os.stat(self.pp).st_ino
 
-            # Shared variable for read a head thread
-            self.read_a_head_enabled = False
-            self.read_a_head_queue = Queue()
-            self.read_a_head_error = Value('b', False)
-            self.offset = Value('L', 0)
-            self.db_end = Value('L', 0)
-            self.size = os.stat(self.pp).st_size
-
-            self.db = open_db(file_system.cache_dir)
-            self.data_cache = FileDataCache(file_system.cache_dir, file_system.cache_size, path, self.db_end, 
-                file_system.charset, flags, inode_id)
-
-            # Start parallel thread for Read A Head
-            #self.read_a_head_process = ReadAHead(file_system, path, flags, mode, self.offset, self.db_end, 
-            #    self.size, self.read_a_head_error, self.read_a_head_queue)
-            #self.read_a_head_process.daemon = True
-            #self.read_a_head_process.start()
+            self.data_cache = FileDataCache(file_system.cache_dir, file_system.cache_size, path, file_system.charset, flags, inode_id)
 
         def read(self, size, offset, recursion=0):
-
-            if offset >= self.size:
-                # Let Fuse handle the eventual error
-                os.lseek(self.f, offset, os.SEEK_SET)
-                buf = os.read(self.f, size)
-                return buf
-            else:
-                self.offset.value = offset
-
-            # Check and see if the read_a_head thread put the first request in the queue
-            #if offset >= self.db_end.value and recursion > 0:
-            #    # First time reading this part of file wait for data from async thread
-            #    print "first access at %s. Waiting for data" % offset
-            #    try:
-            #        buf = self.read_a_head_queue.get(block=True, timeout=2)
-            #        #pprint.pprint(buf[0])
-            #        if buf[0] != offset:
-            #            print "queue has wrond data - recursion #%s" % recursion
-            #            recursion+=1
-            #            buf = self.read(size, offset, recursion)
-            #    except Empty:
-            #        print "queue timeout on recursion #%s" % recursion
-            #        recursion+=1
-            #        buf = self.read(size, offset, recursion)
-            #        
-            #    return buf[1][:size]
-
             try:
                 buf = self.data_cache.read(size, offset)                
             except CacheMiss:
-                if self.read_a_head_error.value:
-                    print "Hello"
-                if self.read_a_head_enabled and not self.read_a_head_error.value:
-                    # Small wait to give the read a head thread time to grab the data
-                    # and prevent running into the recursion limit
-                    recursion+=1
-                    time.sleep(0.05)
-                    buf = self.read(size, offset, recursion)
-                else:
-                    self.read_a_head_error.value = False
-                    os.lseek(self.f, offset, os.SEEK_SET)
-                    buf = os.read(self.f, size)
-                    self.data_cache.update(buf, offset, offset + len(buf) == self.size, self.path)
+
+                os.lseek(self.f, offset, os.SEEK_SET)
+                buf = os.read(self.f, size)
+                self.data_cache.update(buf, offset, offset + len(buf) == self.size, self.path)
             
-            #print "hit - db_end = %s" % self.db_end.value
             return buf
             
 
         def write(self, buf, offset):
-            print('>> file<%s>.write(len(buf)=%d, offset=%s)' % (self.path, len(buf), offset))
+            #print('>> file<%s>.write(len(buf)=%d, offset=%s)' % (self.path, len(buf), offset))
             os.lseek(self.f, offset, os.SEEK_SET)
             os.write(self.f, buf)
-
             self.data_cache.update(buf, offset, offset + len(buf) == self.size, self.path)
-
             return len(buf)
 
 
         def release(self, flags):
-            sys.stdout.flush()
             os.close(self.f)
             self.data_cache.close()
             self.data_cache.report()
@@ -497,7 +327,6 @@ class CacheFS(fuse.Fuse):
         try:
            pp = self._physical_path(path)
            # Hide non-public files (except root)
-
            return os.lstat(pp)
         except Exception, e:
            debug(str(e))
@@ -523,7 +352,7 @@ class CacheFS(fuse.Fuse):
         print('>> unlink("%s")' % path)
         os.remove(self._physical_path(path))
         try:
-            FileDataCache(self.cache_db, self.cache, self.cache_size, path, self.charset).unlink()
+            FileDataCache(self.cache_dir, self.cache_size, path, self.charset).unlink()
         except:
             pass
         return 0
@@ -551,7 +380,7 @@ class CacheFS(fuse.Fuse):
     def rmdir(self, path):
         print('>> rmdir("%s")' % path)
         os.rmdir( self._physical_path(path) )
-        FileDataCache.rmdir(self.cache, path)
+        FileDataCache.rmdir(self.cache_dir, path)
 
     def symlink(self, target, name):
         print('>> symlink("%s", "%s")' % (target, name))
@@ -560,14 +389,14 @@ class CacheFS(fuse.Fuse):
     def link(self, target, name):
         print('>> link(%s, %s)' % (target, name))
         os.link(self._physical_path(target), self._physical_path(name))
-        FileDataCache(self.cache_db, self.cache, self.cache_size, name, self.charset, None, os.stat(self._physical_path(name)).st_ino)
+        FileDataCache(self.cache_dir, self.cache_size, name, self.charset, None, os.stat(self._physical_path(name)).st_ino)
 
     def rename(self, old_name, new_name):
         print('>> rename(%s, %s)' % (old_name, new_name))
         os.rename(self._physical_path(old_name),
                   self._physical_path(new_name))
         try:
-            fdc = FileDataCache(self.cache_db, self.cache, self.cache_size, old_name, self.charset)
+            fdc = FileDataCache(self.cache_dir, self.cache_size, old_name, self.charset)
             fdc.rename(new_name)
         except :
             pass
@@ -583,7 +412,7 @@ class CacheFS(fuse.Fuse):
         f.truncate(len)
         f.close()
         try:
-            cache = FileDataCache(self.cache_db, self.cache, self.cache_size, path, self.charset)
+            cache = FileDataCache(self.cache_dir, self.cache_size, path, self.charset)
             cache.open()
             cache.truncate(len)
             cache.close()
@@ -638,7 +467,7 @@ def main():
                      dash_s_do='setsingle')
 
     server.parser.add_option(
-        mountopt="cache", metavar="PATH",
+        mountopt="cache_dir", metavar="PATH",
         default=None,
         help="Path to place the cache")
 
@@ -665,12 +494,12 @@ def main():
     server.multithreaded = 1
 
     try:
-        server.cache_size = int(server.cache_size)
+        server.cache_size = int(server.cache_size) * (1024 * 1024)
     except AttributeError:
-        server.cache_size = 100 * 1024 * 1024 #5 * 1024 * 1024 * 1024
+        server.cache_size = 1 * 1024 * 1024 * 1024
 
     try:
-        cache_dir = server.cache
+        cache_dir = server.cache_dir
     except AttributeError:
         try:
             os.mkdir(os.path.join(os.path.expanduser("~"), ".cachefs"))
