@@ -58,9 +58,12 @@ class FileDataCache:
         with db:
             if self.node_id != None:
                 db.execute('INSERT OR REPLACE INTO file (node_id,path,last_use) values (?,?,?)', (self.node_id,self.path,time.time()))
+                print "first time opening file!"
             else:
-                for nid, in db.execute('SELECT node_id FROM file WHERE path = ?', (self.path,)):
+                for nid,rah_active in db.execute('SELECT node_id,rah_active FROM file WHERE path = ?', (self.path,)):
                     self.node_id = nid
+                    print "Hello!!!"
+                    print rah_active
 
                 if self.node_id == None:
                     print "Unable to find path in db and no node_id given, unable to open cache"
@@ -99,7 +102,7 @@ class FileDataCache:
         if self.hits + self.misses:
             rate = 100*float(self.hits)/(self.hits + self.misses)
 
-        #print ">> %s Hits: %d, Misses: %d, Rate: %f%%" % (self.path, self.hits, self.misses, rate)
+        print ">> %s Hits: %d, Misses: %d, Rate: %f%%" % (self.path, self.hits, self.misses, rate)
 
     def __del__(self):
         self.close()
@@ -116,12 +119,10 @@ class FileDataCache:
 
     def __conditions__(self, offset, length=None):
         if length != None:
-            return ["node_id = ? AND (offset = ? OR "
-                    "(offset > ? AND offset <= ?) OR (offset < ? AND end >= ?))",
+            return ["node_id = ? AND (offset = ? OR (offset < ? AND end >= ?))",
                     (self.node_id,
                      offset,
-                     offset, offset + length,
-                     offset, offset)]
+                     offset, offset + length)]
         else:
             return ["node_id = ? AND offset <= ? AND end > ?",
                     (self.node_id,            offset,     offset)]
@@ -143,24 +144,28 @@ class FileDataCache:
         return (return_offset, return_size, return_last)
 
     def __add_block___(self, offset, length, last_bytes):
-        end = offset + length
+        insert_offset = offset
+        insert_end = end = offset + length
+
         conditions = self.__conditions__(offset, length)
         query = "select min(offset), max(end) from file_blocks where %s" % conditions[0]
+
         db = open_db(self.cache_dir)
         with db:
             for db_offset, db_end in db.execute(query, conditions[1]):
                 if db_offset == None or db_end == None:
-                    continue
-                offset = min(offset, db_offset)
-                end = max(end, db_end) 
+                    break
+                insert_offset = min(offset, db_offset)
+                insert_end = max(end, db_end)
+
             db.execute("delete from file_blocks where %s" % conditions[0], conditions[1])
-            db.execute('insert into file_blocks values (?, ?, ?, ?)', (self.node_id, offset, end, last_bytes))
+            db.execute('insert into file_blocks values (?, ?, ?, ?)', (self.node_id, insert_offset, insert_end, last_bytes))
 
         db.close()
         return
 
     def read(self, size, offset):
-        #print ">>> READ (size: %s, offset: %s" % (size, offset)
+        # print ">>> READ (size: %s, offset: %s" % (size, offset)
         (addr, s, last_bytes) = self.__overlapping_block__(offset)
         if addr == None or (addr + s < offset + size and not last_bytes):
             self.misses += size
@@ -263,15 +268,12 @@ class FileDataCache:
 
 def File(file_system):
     class CacheFile(object):
-        direct_io = False
-        keep_cache = False
     
         def __init__(self, path, flags, *mode):
-             #print('>> file<%s>.open(flags=%d, mode=%s)' % (self.pp, flags, mode))
             self.path = path
             self.pp = file_system._physical_path(self.path)
             self.size = os.stat(self.pp).st_size
-           
+
             if len(mode) > 0:
                 self.f = os.open(self.pp, flags, mode[0])
             else:
@@ -281,20 +283,20 @@ def File(file_system):
 
             self.data_cache = FileDataCache(file_system.cache_dir, file_system.cache_size, path, file_system.charset, flags, inode_id)
 
-        def read(self, size, offset, recursion=0):
+        def read(self, size, offset):
             try:
                 buf = self.data_cache.read(size, offset)                
             except CacheMiss:
 
                 os.lseek(self.f, offset, os.SEEK_SET)
                 buf = os.read(self.f, size)
+                print "Miss: offset = %s, end = %s" % (offset, offset+len(buf))
                 self.data_cache.update(buf, offset, offset + len(buf) == self.size, self.path)
             
             return buf
             
 
         def write(self, buf, offset):
-            #print('>> file<%s>.write(len(buf)=%d, offset=%s)' % (self.path, len(buf), offset))
             os.lseek(self.f, offset, os.SEEK_SET)
             os.write(self.f, buf)
             self.data_cache.update(buf, offset, offset + len(buf) == self.size, self.path)
@@ -342,7 +344,6 @@ class CacheFS(fuse.Fuse):
             yield fuse.Direntry(virt_path)
 
     def readlink(self, path):
-        #print('>> readlink("%s")' % path)
         phys_resolved = os.readlink(self._physical_path(path))
         debug('   resolves to physical "%s"' % phys_resolved)
         return phys_resolved
@@ -421,7 +422,7 @@ class CacheFS(fuse.Fuse):
 
 
 def open_db(cache_dir):
-    return sqlite3.connect(os.path.join(cache_dir, "metadata.db"), isolation_level="Immediate")
+    return sqlite3.connect(os.path.join(cache_dir, "metadata.db"), isolation_level="DEFERRED")
 
 def create_db(cache_dir):
     cache_db = open_db(cache_dir)
@@ -433,6 +434,7 @@ def create_db(cache_dir):
             path        STRING,
             last_use    INTEGER,
             open        BOOLEAN DEFAULT 1,
+            rah_active  BOOLEAN DEFAULT 0,
             FOREIGN KEY(node_id) REFERENCES nodes(id)
             UNIQUE(path),
             PRIMARY KEY(id)
@@ -449,8 +451,8 @@ def create_db(cache_dir):
         )
     """)
 
-    cache_db.execute("PRAGMA synchronous=OFF")
-    cache_db.execute("PRAGMA journal_mode=OFF")
+    cache_db.execute("PRAGMA synchronous=NORMAL")
+    cache_db.execute("PRAGMA journal_mode=WAL")
     cache_db.close()
 
 def print_help():
@@ -537,6 +539,8 @@ if __name__ == '__main__':
     for arg in sys.argv:
         if arg == '--help':
             print_help()
+            exit()
         if arg == '-h':
             print_help()
+            exit()
     main()
