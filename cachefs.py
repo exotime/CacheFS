@@ -58,7 +58,6 @@ class FileDataCache:
         with db:
             if self.node_id != None:
                 db.execute('INSERT OR REPLACE INTO file (node_id,path,last_use) values (?,?,?)', (self.node_id,self.path,time.time()))
-                print "first time opening file!"
             else:
                 for nid,rah_active in db.execute('SELECT node_id,rah_active FROM file WHERE path = ?', (self.path,)):
                     self.node_id = nid
@@ -290,7 +289,6 @@ def File(file_system):
 
                 os.lseek(self.f, offset, os.SEEK_SET)
                 buf = os.read(self.f, size)
-                print "Miss: offset = %s, end = %s" % (offset, offset+len(buf))
                 self.data_cache.update(buf, offset, offset + len(buf) == self.size, self.path)
             
             return buf
@@ -457,7 +455,24 @@ def create_db(cache_dir):
 
 def print_help():
     print """
-    Help Text Here
+ -- Required Parameters --
+  mount point : Path to mount cached directory
+  target      : Path to be cached
+
+ -- Optional Parameters --
+
+  cache_dir   : Path to place the cached files
+    -- Defaults to ~/.cachefs if not provided
+  cache_size  : Size of the cache in Mega Bytes
+    -- Defaults to 1024 (1 GB)
+  charset     : Charset of the target files system
+    -- Defaults to utf-8
+
+ Format:
+  cachefs.py [mount point] -o target=[path],cache_dir=[path],[...etc] -o [other fuse options]
+
+ Example:
+  cachefs.py /home/joe/CachedFolder -o target=/home/joe/FolderToCache,cache_dir=/home/joe/CachedFiles,cache_size=7168 -o allow_other
     """
     sys.exit()
 
@@ -476,12 +491,12 @@ def main():
     server.parser.add_option(
         mountopt="cache_size", metavar="N",
         default=1 * 1024 * 1024 * 1024,
-        help="size of the cache in bytes")
+        help="Size of the cache in Mega Bytes")
 
     server.parser.add_option(
         mountopt="charset", metavar="PATH CHARSET",
         default="utf-8",
-        help="charset of the target files system")
+        help="Charset of the target files system")
 
     # Wire server.target to command line options
     server.parser.add_option(
@@ -523,10 +538,10 @@ def main():
         server.charset = "utf-8"
 
     print 'Setting up CacheFS %s ...' % CACHE_FS_VERSION
-    print '  Target         : %s' % server.target
-    print '  Target charset : %s' % server.charset
-    print '  Cache          : %s' % server.cache_dir
-    print '  Cache max size : %s' % server.cache_size
+    print '  Target Dir     : %s' % server.target
+    print '  Target Charset : %s' % server.charset
+    print '  Cache Dir      : %s' % server.cache_dir
+    print '  Cache Max Size : %s' % server.cache_size
     print '  Mount Point    : %s' % os.path.abspath(server.fuse_args.mountpoint)
     print
     print 'Unmount through:'
@@ -537,6 +552,7 @@ def main():
 
 if __name__ == '__main__':
     for arg in sys.argv:
+        print arg
         if arg == '--help':
             print_help()
             exit()

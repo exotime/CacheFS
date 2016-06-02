@@ -16,24 +16,26 @@ Install libfuse2 and python bindings
 
 Grab the latest CacheFS
 
-    git clone git@github.com:cconstantine/CacheFS.git
+    git clone git@github.com:cfoucher/CacheFS.git
 
 
 Start caching
 
-    ./CacheFS/cachefs.py <mount point> -o target=<slow drive>
+    ./CacheFS/cachefs.py [mount point] -o target=[slow drive]
 
 Thats it!
 
 Usage
 -----
-    cachefs.py <mount> -o target=<slow drive>,cache=<fast drive>
+    cachefs.py [mount point] -o target=[slow drive],cache_dir=[path],[...etc] -o [other fuse options]
 
-mount:  The directory you want to mount cachefs to.  Interacting with files in this directory after mounting a volume will use cachefs.
+mount point:  The directory you want to mount cachefs to.  Interacting with files in this directory after mounting a volume will use cachefs.
 
 target:  This is the volume or directory you wish to cache.  
 
-cache:  This optional argument specifies where you wish the cache to be stored.  If it is not specified a place will be created for you in your home directory.
+cache_dir:  This optional argument specifies where you wish the cache to be stored.  If it is not specified a place will be created for you in your home directory.
+
+cache_size: This optional argument specifies the max amount of data to be cached. This is a soft limit i.e. cache can expand beyond this limit if multiple files are open at once, exceeding this value. This is set in MB, defaulting to 1024 MB (1GB) if not specified.
 
 
 Why
@@ -50,7 +52,6 @@ You could theoreticaly use this to create a hierarchy of volumes from a ramdrive
 
 To Be Implemented
 ------------------
-There is currently no way to specify how much space on the small/fast disk to use.  If the small disk runs out of space you are SOL.
 
 The time to complete write operations (or any fs modifications) is the time it takes to modify both the slow disk and the fast disk.  This needs to be changed so that modification operations happen on the cache, and then go to the slow disk in the background.  
 
