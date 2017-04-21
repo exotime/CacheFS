@@ -12,7 +12,7 @@ Quick Start (Ubuntu)
 -----------
 Install libfuse2 and python bindings
 
-    sudo apt-get install libfuse2 python-fuse
+    sudo apt-get install libfuse2 python-fuse python-pysqlite2
 
 Grab the latest CacheFS
 
